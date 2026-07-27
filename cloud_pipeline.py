@@ -54,12 +54,28 @@ def calculate_completeness(job):
     return score
 
 
+def get_stable_id(job):
+    """Return the STABLE, globally-unique job identifier.
+
+    RapidAPI/JSearch change (2026): the `job_id` field is now longer and
+    regenerated on every Search call, so it is NO LONGER stable across runs.
+    The constant, globally-unique value now lives in `job_uid` (it holds the
+    exact value `job_id` held previously). We key dedup on `job_uid`, falling
+    back to `job_id` only if `job_uid` is missing on a record.
+    """
+    return job.get("job_uid") or job.get("job_id")
+
+
 def fetch_known_job_ids():
-    """Query BigQuery for job_ids from the last 30 days to enable cross-run deduplication.
-    Returns a set of job_id strings already in the table.
-    
-    Failure mode: if the query fails, returns an empty set and the pipeline proceeds
-    without dedup. Logged as a warning but not fatal.
+    """Query BigQuery for stable job ids from the last 30 days to enable
+    cross-run deduplication. Returns a set of id strings already in the table.
+
+    Note: the `job_id` COLUMN in BigQuery now stores stable job_uid values
+    (see get_stable_id). Older rows may hold legacy ids; per JSearch, job_uid
+    equals the previous job_id value, so old and new remain compatible.
+
+    Failure mode: if the query fails, returns an empty set and the pipeline
+    proceeds without dedup. Logged as a warning but not fatal.
     """
     try:
         query = f"""
@@ -70,7 +86,7 @@ def fetch_known_job_ids():
         """
         result = bq_client.query(query).result()
         known_ids = {row.job_id for row in result if row.job_id}
-        log.info(f"Cross-run dedup: loaded {len(known_ids)} known job_ids from last 30 days.")
+        log.info(f"Cross-run dedup: loaded {len(known_ids)} known ids from last 30 days.")
         return known_ids
     except Exception as e:
         log.warning(f"Cross-run dedup query failed (proceeding without dedup): {e}")
@@ -196,7 +212,7 @@ Return JSON with exactly these fields:
         structured_data = json.loads(response.text)
         
         if not isinstance(structured_data, dict):
-            log.warning(f"Gemini returned non-dict for job {job.get('job_id')}, skipping.")
+            log.warning(f"Gemini returned non-dict for job {get_stable_id(job)}, skipping.")
             return None, "fallback_raw"
         
         for list_field in ["tools", "hard_skills", "soft_skills", "benefits"]:
@@ -214,7 +230,9 @@ Return JSON with exactly these fields:
             except (ValueError, TypeError):
                 pass
         
-        structured_data["job_id"] = job.get("job_id")
+        # STABLE ID FIX: store job_uid (stable) in the job_id column, not the
+        # now-unstable per-search job_id. Fallback preserves old behavior if missing.
+        structured_data["job_id"] = get_stable_id(job)
         structured_data["date_retrieved"] = time.strftime("%Y-%m-%d")
         structured_data["job_url"] = job.get("job_apply_link")
         structured_data["source_api"] = derive_source_api(job)
@@ -226,7 +244,7 @@ Return JSON with exactly these fields:
             log.warning("Gemini API Free Rate Limit spiked. Shifting row into raw fallback state.")
             return None, "exhausted_raw"
         
-        log.warning(f"Failed to enrich job {job.get('job_id')}: {gemini_err}")
+        log.warning(f"Failed to enrich job {get_stable_id(job)}: {gemini_err}")
         return None, "fallback_raw"
 
 
@@ -254,7 +272,7 @@ def main():
         "x-rapidapi-host": "jsearch.p.rapidapi.com"
     }
 
-    # CROSS-RUN DEDUP: load known job_ids from last 30 days BEFORE harvesting
+    # CROSS-RUN DEDUP: load known stable ids from last 30 days BEFORE harvesting
     known_job_ids = fetch_known_job_ids()
     
     deduplicated_jobs = {}
@@ -292,8 +310,9 @@ def main():
                         for job in job_data_list:
                             metrics["harvested"] += 1
                             
-                            # CROSS-RUN DEDUP: skip jobs already in BigQuery from previous runs
-                            if job.get("job_id") in known_job_ids:
+                            # CROSS-RUN DEDUP: skip jobs already in BigQuery from previous runs.
+                            # Compare on the STABLE id (job_uid) to match what we store.
+                            if get_stable_id(job) in known_job_ids:
                                 metrics["skipped_cross_run"] += 1
                                 continue
                             
