@@ -11,27 +11,10 @@ from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 
-# Initialize Environment and Logging
 load_dotenv()
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("cloud_pipeline")
 
-# ---------------------------------------------------------------------------
-# HYBRID ENRICHMENT
-# JSearch /job-details provides native enrichment. We overlay the two fields
-# where JSearch beat Gemini in testing AND that already exist in the schema:
-#   - remote_status (from work_arrangement)  [JSearch 100% vs Gemini 53%]
-#   - education     (from education_required.level)
-# Gemini is the FLOOR: if /job-details fails or a field is missing, Gemini's
-# value stays. A job is NEVER dropped because details failed.
-# Seniority is intentionally NOT taken from JSearch - it stays derived in the
-# v_dashboard view (uniform across all rows). Industry/tools/skills stay Gemini.
-# ---------------------------------------------------------------------------
-
-# Infrastructure Constants
 PROJECT_ID = os.getenv("GCP_PROJECT_ID")
 DATASET_ID = "data_job_market"
 TABLE_NAME = "us_job_data"
@@ -43,7 +26,6 @@ JSEARCH_HEADERS = {
     "x-rapidapi-host": "jsearch.p.rapidapi.com",
 }
 
-# Initialize Google Cloud Clients with bulletproof Base64 Decoding
 try:
     sa_key_b64 = os.getenv("GCP_SA_KEY_B64")
     if sa_key_b64:
@@ -58,7 +40,6 @@ except Exception as e:
     log.error(f"Failed to initialize BigQuery client: {e}")
     raise
 
-# Initialize Gemini Client
 ai_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 
@@ -71,8 +52,6 @@ def calculate_completeness(job):
 
 
 def get_stable_id(job):
-    """Stable, globally-unique id for dedup. job_uid is stable; job_id is now
-    per-search (unstable) after the 2026 JSearch change. Fall back to job_id."""
     return job.get("job_uid") or job.get("job_id")
 
 
@@ -82,11 +61,10 @@ def fetch_known_job_ids():
         SELECT DISTINCT job_id
         FROM `{TABLE_ID}`
         WHERE job_id IS NOT NULL
-          AND date_retrieved >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
         """
         result = bq_client.query(query).result()
         known = {row.job_id for row in result if row.job_id}
-        log.info(f"Cross-run dedup: loaded {len(known)} known ids from last 30 days.")
+        log.info(f"Cross-run dedup: loaded {len(known)} known ids (all-time).")
         return known
     except Exception as e:
         log.warning(f"Cross-run dedup query failed (proceeding without dedup): {e}")
@@ -127,9 +105,8 @@ def derive_source_api(job):
 
 
 def jsearch_details(per_search_job_id):
-    """Fetch JSearch native enrichment for one job. Uses the PER-SEARCH job_id
-    (the long one), which is what the Job Details endpoint requires post-2026.
-    Returns {} on any failure - caller treats missing details as 'use Gemini'."""
+    """Fetch JSearch native enrichment. Uses PER-SEARCH job_id (required by
+    Job Details endpoint post-2026). Returns {} on failure -> Gemini fallback."""
     if not per_search_job_id:
         return {}
     params = {"job_id": per_search_job_id, "country": "us"}
@@ -145,7 +122,6 @@ def jsearch_details(per_search_job_id):
 
 
 def map_work_arrangement(val):
-    """JSearch work_arrangement -> schema remote_status. None if unmappable."""
     if not val:
         return None
     v = str(val).strip().lower()
@@ -159,7 +135,6 @@ def map_work_arrangement(val):
 
 
 def map_education_level(edu_required):
-    """JSearch education_required.level -> a clean education string. None if absent."""
     if not isinstance(edu_required, dict):
         return None
     lvl = edu_required.get("level")
@@ -180,9 +155,7 @@ def map_education_level(edu_required):
 
 
 def process_single_job_with_retry(job):
-    # 4.5s throttle keeps Gemini ~13 RPM, under the 15 RPM Flash Lite limit
-    time.sleep(4.5)
-
+    time.sleep(4.5)  # ~13 RPM, under 15 RPM Flash Lite limit
     raw_description = job.get("job_description", "")
     if not raw_description:
         return None, "fallback_raw"
@@ -247,7 +220,6 @@ Return JSON with exactly these fields:
             if isinstance(structured_data.get(list_field), list):
                 structured_data[list_field] = ", ".join(str(i) for i in structured_data[list_field])
 
-        # Salary fallback from JSearch upstream
         if structured_data.get("salary_min") is None and job.get("job_min_salary") is not None:
             try:
                 structured_data["salary_min"] = float(job.get("job_min_salary"))
@@ -259,11 +231,8 @@ Return JSON with exactly these fields:
             except (ValueError, TypeError):
                 pass
 
-        # ---- HYBRID OVERLAY: JSearch native fields win where present ----
-        # Gemini output above is the FLOOR. If details succeed, overlay the two
-        # fields JSearch does better (remote_status, education). If details fail
-        # or a field is missing, Gemini's value stays. Job saved either way.
-        details = jsearch_details(job.get("job_id"))  # per-search id for /job-details
+        # HYBRID OVERLAY: JSearch native fields win where present (remote_status, education)
+        details = jsearch_details(job.get("job_id"))  # per-search id
         if details:
             ra = map_work_arrangement(details.get("work_arrangement"))
             if ra:
@@ -271,9 +240,7 @@ Return JSON with exactly these fields:
             edu = map_education_level(details.get("education_required"))
             if edu:
                 structured_data["education"] = edu
-        # ----------------------------------------------------------------
 
-        # Metadata fields matching the BigQuery schema
         structured_data["job_id"] = get_stable_id(job)
         structured_data["date_retrieved"] = time.strftime("%Y-%m-%d")
         structured_data["job_url"] = job.get("job_apply_link")
@@ -293,69 +260,71 @@ def main():
     start_time = time.time()
 
     queries = [
-        "Data Analyst in USA",
-        "Business Analyst in USA",
-        "Business Intelligence Analyst in USA",
-        "BI Analyst in USA",
-        "Data Scientist in USA",
-        "Marketing Analyst in USA",
-        "Finance Analyst in USA",
-        "Healthcare Analyst in USA",
-        "Operations Analyst in USA",
-        "Product Analyst in USA",
-        "Risk Analyst in USA",
-        "Logistics Analyst in USA",
+        "Data Analyst in USA", "Business Analyst in USA",
+        "Business Intelligence Analyst in USA", "BI Analyst in USA",
+        "Data Scientist in USA", "Marketing Analyst in USA",
+        "Finance Analyst in USA", "Healthcare Analyst in USA",
+        "Operations Analyst in USA", "Product Analyst in USA",
+        "Risk Analyst in USA", "Logistics Analyst in USA",
         "Supply Chain Analyst in USA",
     ]
 
     known_job_ids = fetch_known_job_ids()
 
-    deduplicated_jobs = {}
-    metrics = {
-        "harvested": 0, "skipped_cross_run": 0, "processed": 0,
-        "enriched": 0, "fallback_raw": 0, "exhausted_raw": 0, "loaded": 0,
-    }
+    # In-run dedup: a posting is the "same" if its stable id matches an
+    # already-seen id OR its (company, title, city) matches an already-seen
+    # composite. uid_index / comp_index both point at the same canonical key.
+    dedup_store = {}   # canonical key -> chosen job
+    uid_index = {}     # stable id -> canonical key
+    comp_index = {}    # (company, title, city) -> canonical key
+
+    metrics = {"harvested": 0, "skipped_cross_run": 0, "processed": 0,
+               "enriched": 0, "fallback_raw": 0, "exhausted_raw": 0, "loaded": 0}
 
     log.info("Launching hybrid daily cloud harvest pipeline (JSearch-details + Gemini)...")
 
     with httpx.Client() as client:
         for q in queries:
-            # 6 pages per query (was 4). date_posted stays 'today'.
-            for page_num in range(1, 7):
+            for page_num in range(1, 7):  # 6 pages
                 try:
-                    params = {
-                        "query": q, "page": str(page_num),
-                        "date_posted": "today", "country": "us",
-                        "remote_jobs_only": "false",
-                    }
+                    params = {"query": q, "page": str(page_num), "date_posted": "today",
+                              "country": "us", "remote_jobs_only": "false"}
                     response = client.get("https://jsearch.p.rapidapi.com/search",
                                           headers=JSEARCH_HEADERS, params=params, timeout=30.0)
                     if response.status_code == 200:
                         job_data_list = response.json().get("data", [])
                         if not job_data_list:
-                            break  # query exhausted for today; stop paging it
+                            break
                         for job in job_data_list:
                             metrics["harvested"] += 1
-                            if get_stable_id(job) in known_job_ids:
+                            uid = get_stable_id(job)
+                            if uid in known_job_ids:
                                 metrics["skipped_cross_run"] += 1
                                 continue
                             company_clean = str(job.get("employer_name", "")).strip().lower()
                             title_clean = str(job.get("job_title", "")).strip().lower()
                             city_clean = str(job.get("job_city", "")).strip().lower()
-                            key = (company_clean, title_clean, city_clean)
-                            if key not in deduplicated_jobs:
-                                deduplicated_jobs[key] = job
+                            comp = (company_clean, title_clean, city_clean)
+                            # same job if stable id matches OR the composite matches
+                            existing = (uid_index.get(uid) if uid else None) or comp_index.get(comp)
+                            if existing is None:
+                                canonical = uid if uid else comp
+                                dedup_store[canonical] = job
+                                if uid:
+                                    uid_index[uid] = canonical
+                                comp_index[comp] = canonical
                             else:
-                                cur = calculate_completeness(deduplicated_jobs[key])
-                                inc = calculate_completeness(job)
-                                if inc > cur:
-                                    deduplicated_jobs[key] = job
+                                if calculate_completeness(job) > calculate_completeness(dedup_store[existing]):
+                                    dedup_store[existing] = job
+                                if uid:
+                                    uid_index[uid] = existing
+                                comp_index[comp] = existing
                     time.sleep(1.2)
                 except Exception as e:
                     log.warning(f"API download anomaly on '{q}' page {page_num}: {e}")
                     break
 
-    job_list = list(deduplicated_jobs.values())
+    job_list = list(dedup_store.values())
     total_to_process = len(job_list)
     log.info(f"Dedup complete. Processing {total_to_process} unique net-new items...")
 
@@ -372,7 +341,6 @@ def main():
             log.critical("Consecutive rate limits. Aborting loop early to safeguard data.")
             break
 
-    # SAFETY NET: dump enriched rows before BigQuery insert
     if buffer:
         backup_filename = f"enriched_backup_{int(time.time())}.json"
         try:
@@ -382,7 +350,6 @@ def main():
         except Exception as backup_err:
             log.error(f"Failed to write backup file: {backup_err}")
 
-    # Bulk load
     if buffer:
         chunk_size = 50
         for i in range(0, len(buffer), chunk_size):
