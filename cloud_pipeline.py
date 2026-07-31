@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import logging
 import httpx
@@ -41,6 +42,14 @@ except Exception as e:
     raise
 
 ai_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+
+def is_us_job(job):
+    """US-only guard. Strips punctuation/case so U.S.A., u-s-a, usa all match.
+    Missing country -> False (fail closed: dashboard must be 100% US)."""
+    raw = str(job.get("job_country") or "")
+    norm = re.sub(r"[^A-Z]", "", raw.upper())
+    return norm in {"US", "USA", "UNITEDSTATES", "UNITEDSTATESOFAMERICA"}
 
 
 def calculate_completeness(job):
@@ -271,15 +280,14 @@ def main():
 
     known_job_ids = fetch_known_job_ids()
 
-    # In-run dedup: a posting is the "same" if its stable id matches an
-    # already-seen id OR its (company, title, city) matches an already-seen
-    # composite. uid_index / comp_index both point at the same canonical key.
+    # In-run dedup: same job if stable id matches OR (company, title, city) matches.
     dedup_store = {}   # canonical key -> chosen job
     uid_index = {}     # stable id -> canonical key
     comp_index = {}    # (company, title, city) -> canonical key
 
-    metrics = {"harvested": 0, "skipped_cross_run": 0, "processed": 0,
-               "enriched": 0, "fallback_raw": 0, "exhausted_raw": 0, "loaded": 0}
+    metrics = {"harvested": 0, "skipped_non_us": 0, "skipped_cross_run": 0,
+               "processed": 0, "enriched": 0, "fallback_raw": 0,
+               "exhausted_raw": 0, "loaded": 0}
 
     log.info("Launching hybrid daily cloud harvest pipeline (JSearch-details + Gemini)...")
 
@@ -297,6 +305,11 @@ def main():
                             break
                         for job in job_data_list:
                             metrics["harvested"] += 1
+                            # US-ONLY GUARD: JSearch's country param is a hint, not a
+                            # filter. Verify job_country ourselves before anything else.
+                            if not is_us_job(job):
+                                metrics["skipped_non_us"] += 1
+                                continue
                             uid = get_stable_id(job)
                             if uid in known_job_ids:
                                 metrics["skipped_cross_run"] += 1
@@ -305,7 +318,6 @@ def main():
                             title_clean = str(job.get("job_title", "")).strip().lower()
                             city_clean = str(job.get("job_city", "")).strip().lower()
                             comp = (company_clean, title_clean, city_clean)
-                            # same job if stable id matches OR the composite matches
                             existing = (uid_index.get(uid) if uid else None) or comp_index.get(comp)
                             if existing is None:
                                 canonical = uid if uid else comp
@@ -365,6 +377,7 @@ def main():
     elapsed = int(time.time() - start_time)
     summary = (
         f"METRICS_SUMMARY: harvested={metrics['harvested']}, "
+        f"skipped_non_us={metrics['skipped_non_us']}, "
         f"skipped_cross_run={metrics['skipped_cross_run']}, "
         f"unique={total_to_process}, enriched={metrics['enriched']}, "
         f"fallback={metrics['fallback_raw']}, exhausted={metrics['exhausted_raw']}, "
