@@ -27,6 +27,16 @@ JSEARCH_HEADERS = {
     "x-rapidapi-host": "jsearch.p.rapidapi.com",
 }
 
+# JSearch v5 (2026): /search became /search-v2, page-by-page looping was replaced
+# by a single call with num_pages, results moved from data[] to data.jobs[], and
+# remote_jobs_only was renamed work_from_home.
+JSEARCH_SEARCH_URL = "https://jsearch.p.rapidapi.com/search-v2"
+JSEARCH_DETAILS_URL = "https://jsearch.p.rapidapi.com/job-details"
+SEARCH_NUM_PAGES = "6"
+# CATCH-UP RUN: set to "week" to backfill the gap. Change back to "3days"
+# after the catch-up run succeeds — that is the steady-state value.
+SEARCH_DATE_POSTED = "week"
+
 try:
     sa_key_b64 = os.getenv("GCP_SA_KEY_B64")
     if sa_key_b64:
@@ -115,16 +125,20 @@ def derive_source_api(job):
 
 def jsearch_details(per_search_job_id):
     """Fetch JSearch native enrichment. Uses PER-SEARCH job_id (required by
-    Job Details endpoint post-2026). Returns {} on failure -> Gemini fallback."""
+    Job Details endpoint post-2026). Returns {} on failure -> Gemini fallback.
+    v5 may return either a list or a single object under 'data'."""
     if not per_search_job_id:
         return {}
     params = {"job_id": per_search_job_id, "country": "us"}
     try:
-        r = httpx.get("https://jsearch.p.rapidapi.com/job-details",
+        r = httpx.get(JSEARCH_DETAILS_URL,
                       headers=JSEARCH_HEADERS, params=params, timeout=30.0)
         if r.status_code == 200:
-            data = r.json().get("data", [])
-            return data[0] if data else {}
+            data = r.json().get("data")
+            if isinstance(data, list):
+                return data[0] if data else {}
+            if isinstance(data, dict):
+                return data
     except Exception as e:
         log.warning(f"job-details failed for {per_search_job_id}: {e}")
     return {}
@@ -293,48 +307,49 @@ def main():
 
     with httpx.Client() as client:
         for q in queries:
-            for page_num in range(1, 7):  # 6 pages
-                try:
-                    params = {"query": q, "page": str(page_num), "date_posted": "today",
-                              "country": "us", "remote_jobs_only": "false"}
-                    response = client.get("https://jsearch.p.rapidapi.com/search",
-                                          headers=JSEARCH_HEADERS, params=params, timeout=30.0)
-                    if response.status_code == 200:
-                        job_data_list = response.json().get("data", [])
-                        if not job_data_list:
-                            break
-                        for job in job_data_list:
-                            metrics["harvested"] += 1
-                            # US-ONLY GUARD: JSearch's country param is a hint, not a
-                            # filter. Verify job_country ourselves before anything else.
-                            if not is_us_job(job):
-                                metrics["skipped_non_us"] += 1
-                                continue
-                            uid = get_stable_id(job)
-                            if uid in known_job_ids:
-                                metrics["skipped_cross_run"] += 1
-                                continue
-                            company_clean = str(job.get("employer_name", "")).strip().lower()
-                            title_clean = str(job.get("job_title", "")).strip().lower()
-                            city_clean = str(job.get("job_city", "")).strip().lower()
-                            comp = (company_clean, title_clean, city_clean)
-                            existing = (uid_index.get(uid) if uid else None) or comp_index.get(comp)
-                            if existing is None:
-                                canonical = uid if uid else comp
-                                dedup_store[canonical] = job
-                                if uid:
-                                    uid_index[uid] = canonical
-                                comp_index[comp] = canonical
-                            else:
-                                if calculate_completeness(job) > calculate_completeness(dedup_store[existing]):
-                                    dedup_store[existing] = job
-                                if uid:
-                                    uid_index[uid] = existing
-                                comp_index[comp] = existing
-                    time.sleep(1.2)
-                except Exception as e:
-                    log.warning(f"API download anomaly on '{q}' page {page_num}: {e}")
-                    break
+            try:
+                params = {"query": q, "num_pages": SEARCH_NUM_PAGES,
+                          "date_posted": SEARCH_DATE_POSTED,
+                          "country": "us", "work_from_home": "false"}
+                response = client.get(JSEARCH_SEARCH_URL,
+                                      headers=JSEARCH_HEADERS, params=params, timeout=60.0)
+                if response.status_code != 200:
+                    log.warning(f"JSearch returned {response.status_code} on '{q}'")
+                else:
+                    payload = response.json().get("data") or {}
+                    # v5 nests results under data.jobs; tolerate a bare list too.
+                    job_data_list = payload.get("jobs", []) if isinstance(payload, dict) else payload
+                    for job in job_data_list:
+                        metrics["harvested"] += 1
+                        # US-ONLY GUARD: JSearch's country param is a hint, not a
+                        # filter. Verify job_country ourselves before anything else.
+                        if not is_us_job(job):
+                            metrics["skipped_non_us"] += 1
+                            continue
+                        uid = get_stable_id(job)
+                        if uid in known_job_ids:
+                            metrics["skipped_cross_run"] += 1
+                            continue
+                        company_clean = str(job.get("employer_name", "")).strip().lower()
+                        title_clean = str(job.get("job_title", "")).strip().lower()
+                        city_clean = str(job.get("job_city", "")).strip().lower()
+                        comp = (company_clean, title_clean, city_clean)
+                        existing = (uid_index.get(uid) if uid else None) or comp_index.get(comp)
+                        if existing is None:
+                            canonical = uid if uid else comp
+                            dedup_store[canonical] = job
+                            if uid:
+                                uid_index[uid] = canonical
+                            comp_index[comp] = canonical
+                        else:
+                            if calculate_completeness(job) > calculate_completeness(dedup_store[existing]):
+                                dedup_store[existing] = job
+                            if uid:
+                                uid_index[uid] = existing
+                            comp_index[comp] = existing
+                time.sleep(1.2)
+            except Exception as e:
+                log.warning(f"API download anomaly on '{q}': {e}")
 
     job_list = list(dedup_store.values())
     total_to_process = len(job_list)
