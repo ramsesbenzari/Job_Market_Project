@@ -35,7 +35,7 @@ JSEARCH_DETAILS_URL = "https://jsearch.p.rapidapi.com/job-details"
 SEARCH_NUM_PAGES = "6"
 # CATCH-UP RUN: set to "week" to backfill the gap. Change back to "3days"
 # after the catch-up run succeeds — that is the steady-state value.
-SEARCH_DATE_POSTED = "3days"
+SEARCH_DATE_POSTED = "today"
 
 try:
     sa_key_b64 = os.getenv("GCP_SA_KEY_B64")
