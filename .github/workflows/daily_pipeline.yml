@@ -24,43 +24,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install httpx google-genai google-cloud-bigquery pydantic python-dotenv
 
-      - name: Diagnose auth before pipeline runs
-        env:
-          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-          GCP_SA_KEY_B64: ${{ secrets.GCP_SA_KEY_B64 }}
-        run: |
-          python <<'EOF'
-          import os, json, base64, time
-          from google.oauth2 import service_account
-          from google.auth.transport.requests import Request
-          from google.cloud import bigquery
-
-          info = json.loads(base64.b64decode(os.environ["GCP_SA_KEY_B64"]).decode("utf-8"))
-          print(f"SA email:       {info['client_email']}")
-          print(f"Project in key: {info['project_id']}")
-          print(f"Project in env: {os.environ['GCP_PROJECT_ID']}")
-          print(f"Key ID:         {info['private_key_id']}")
-          print(f"Runner UTC:     {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}")
-
-          creds = service_account.Credentials.from_service_account_info(
-              info, scopes=["https://www.googleapis.com/auth/cloud-platform"]
-          )
-          print("\nMinting access token...")
-          creds.refresh(Request())
-          print(f"Token minted OK, expires {creds.expiry}")
-
-          print("\nListing datasets...")
-          client = bigquery.Client(project=os.environ["GCP_PROJECT_ID"], credentials=creds)
-          print(f"Found datasets: {[d.dataset_id for d in client.list_datasets()]}")
-          EOF
-
+      
       - name: Run pipeline
         run: python cloud_pipeline.py | tee pipeline_run.log
         env:
           RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-          GCP_SA_KEY_JSON: ${{ secrets.GCP_SA_KEY_JSON }}
           GCP_SA_KEY_B64: ${{ secrets.GCP_SA_KEY_B64 }}
 
       - name: Upload enriched backup artifact

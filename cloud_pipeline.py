@@ -33,8 +33,6 @@ JSEARCH_HEADERS = {
 JSEARCH_SEARCH_URL = "https://jsearch.p.rapidapi.com/search-v2"
 JSEARCH_DETAILS_URL = "https://jsearch.p.rapidapi.com/job-details"
 SEARCH_NUM_PAGES = "6"
-# CATCH-UP RUN: set to "week" to backfill the gap. Change back to "3days"
-# after the catch-up run succeeds — that is the steady-state value.
 SEARCH_DATE_POSTED = "today"
 
 try:
@@ -71,19 +69,22 @@ def calculate_completeness(job):
 
 
 def get_stable_id(job):
-    return job.get("job_uid") or job.get("job_id")
+    """Dedup key. The posting URL is the same key used by the dashboard view,
+    and it does not depend on the API's identifier scheme staying put -
+    job_id turned out to be a per-search token that rotated on every call."""
+    return job.get("job_apply_link") or job.get("job_uid") or job.get("job_id")
 
 
 def fetch_known_job_ids():
     try:
         query = f"""
-        SELECT DISTINCT job_id
+        SELECT DISTINCT job_url
         FROM `{TABLE_ID}`
-        WHERE job_id IS NOT NULL
+        WHERE job_url IS NOT NULL
         """
         result = bq_client.query(query).result()
-        known = {row.job_id for row in result if row.job_id}
-        log.info(f"Cross-run dedup: loaded {len(known)} known ids (all-time).")
+        known = {row.job_url for row in result if row.job_url}
+        log.info(f"Cross-run dedup: loaded {len(known)} known job urls (all-time).")
         return known
     except Exception as e:
         log.warning(f"Cross-run dedup query failed (proceeding without dedup): {e}")
@@ -264,7 +265,7 @@ Return JSON with exactly these fields:
             if edu:
                 structured_data["education"] = edu
 
-        structured_data["job_id"] = get_stable_id(job)
+        structured_data["job_id"] = job.get("job_uid") or job.get("job_id")
         structured_data["date_retrieved"] = time.strftime("%Y-%m-%d")
         structured_data["job_url"] = job.get("job_apply_link")
         structured_data["source_api"] = derive_source_api(job)
