@@ -3,3 +3,8 @@
 __pycache__/
 *.pyc
 *.json
+emergency_backup.json
+enriched_backup_*.json
+*.pbix
+credentials.json
+.venv/
