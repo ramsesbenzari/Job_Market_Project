@@ -230,11 +230,26 @@ Return JSON with exactly these fields:
 """
 
     try:
-        response = ai_client.models.generate_content(
-            model='gemini-3.1-flash-lite',
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json"),
-        )
+        # Gemini's free tier refuses requests in bursts when it is overloaded
+        # (503 "high demand"). Wait and retry twice before giving up. Because
+        # postings are processed one at a time, the wait also pauses the run
+        # until the burst passes, so the next posting usually goes through.
+        # Any other error (including 429 quota) is raised straight away.
+        response = None
+        for wait in (30, 60, None):
+            try:
+                response = ai_client.models.generate_content(
+                    model='gemini-3.1-flash-lite',
+                    contents=prompt,
+                    config=types.GenerateContentConfig(response_mime_type="application/json"),
+                )
+                break
+            except Exception as call_err:
+                if "503" in str(call_err) and wait is not None:
+                    log.info(f"Gemini busy (503), retrying in {wait}s")
+                    time.sleep(wait)
+                    continue
+                raise
         structured_data = json.loads(response.text)
         if not isinstance(structured_data, dict):
             log.warning(f"Gemini returned non-dict for {get_stable_id(job)}, skipping.")
