@@ -91,6 +91,57 @@ def fetch_known_job_ids():
         return set()
 
 
+# BigQuery sandbox (no billing) deletes every table and view 60 days after it
+# was CREATED, and won't let that date be pushed back. Rebuilding an object
+# gives it a fresh creation date, so each run renews anything with less than
+# RENEW_WHEN_DAYS_LEFT left. Tables are copied onto themselves in one atomic
+# step. Views are dropped and recreated from their own live definition, which
+# is checked with a free dry run first. Any failure is logged and the
+# pipeline carries on; the next daily run tries again.
+RENEW_WHEN_DAYS_LEFT = 30
+RENEW_OBJECTS = ["us_job_data", "v_dashboard", "v_skills_exploded"]
+
+
+def renew_expiring_objects():
+    for name in RENEW_OBJECTS:
+        full_id = f"{PROJECT_ID}.{DATASET_ID}.{name}"
+        try:
+            obj = bq_client.get_table(full_id)
+            if obj.expires is None:
+                continue
+            days_left = (obj.expires.timestamp() - time.time()) / 86400
+            if days_left > RENEW_WHEN_DAYS_LEFT:
+                log.info(f"Expiry check: {name} has {days_left:.0f} days left, no action")
+                continue
+
+            if obj.table_type == "VIEW":
+                view_sql = obj.view_query
+                dry = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)
+                bq_client.query(view_sql, job_config=dry)  # raises if the SQL is invalid
+                bq_client.query(f"DROP VIEW `{full_id}`").result()
+                created = False
+                for attempt in range(3):
+                    try:
+                        bq_client.query(f"CREATE VIEW `{full_id}` AS\n{view_sql}").result()
+                        created = True
+                        break
+                    except Exception as create_err:
+                        log.error(f"Recreating view {name} failed (attempt {attempt + 1}): {create_err}")
+                        time.sleep(10)
+                if not created:
+                    log.error(f"VIEW {name} WAS DROPPED AND NOT RECREATED. Its SQL follows, run it by hand:")
+                    log.error(f"CREATE VIEW `{full_id}` AS\n{view_sql}")
+                    continue
+            else:
+                bq_client.query(
+                    f"CREATE OR REPLACE TABLE `{full_id}` AS SELECT * FROM `{full_id}`"
+                ).result()
+
+            log.info(f"Expiry renewed: {name} had {days_left:.0f} days left, now 60")
+        except Exception as e:
+            log.warning(f"Expiry renewal skipped for {name}: {e}")
+
+
 def derive_source_api(job):
     publisher = job.get("job_publisher")
     if publisher:
@@ -298,6 +349,8 @@ Return JSON with exactly these fields:
 def main():
     start_time = time.time()
 
+    renew_expiring_objects()
+
     queries = [
         "Data Analyst in USA", "Business Analyst in USA",
         "Business Intelligence Analyst in USA", "BI Analyst in USA",
@@ -374,6 +427,14 @@ def main():
     buffer = []
     consecutive_exhaustions = 0
     for job in job_list:
+        # GitHub stops any job at 6 hours, and rows are only saved after this
+        # loop ends. On a long Gemini outage the 503 retries can stretch the
+        # run, so stop starting new postings at 5.5 hours and save what's done.
+        # Postings not reached aren't written, so they can be picked up again
+        # by a later run if they are still in its date window.
+        if time.time() - start_time > 5.5 * 3600:
+            log.warning("5.5-hour limit reached, stopping and saving what's done")
+            break
         metrics["processed"] += 1
         row, status = process_single_job_with_retry(job)
         metrics[status] += 1
